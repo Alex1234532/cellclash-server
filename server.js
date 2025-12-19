@@ -1,6 +1,6 @@
 //-----------------------------------------------------------
 // CELL CLASH — PRO MULTIPLAYER SERVER
-// Authoritative tick-based world like Agar.io
+// Tick simulation — Players, Bots, Pellets, Viruses, Splitting
 //-----------------------------------------------------------
 
 const express = require("express");
@@ -15,21 +15,25 @@ app.use(cors());
 const PORT = process.env.PORT || 10000;
 
 //-----------------------------------------------------------
-// Utility
+// CONSTANTS — MUST MATCH CODEA
+//-----------------------------------------------------------
+
+const WORLD_SIZE = 5200;
+const TICK_RATE = 30;
+
+const PLAYER_START_MASS = 40;
+const BOT_COUNT = 12;
+const VIRUS_COUNT = 28;
+
+const PELLET_MIN = 500;     // always maintain
+const PELLET_RESPAWN = 550; // if below, spawn more
+
+//-----------------------------------------------------------
+// Utility functions
 //-----------------------------------------------------------
 
 function rand(min, max) {
     return Math.random() * (max - min) + min;
-}
-
-function newVec() {
-    return { x: 0, y: 0 };
-}
-
-function normalize(v) {
-    const d = Math.sqrt(v.x * v.x + v.y * v.y);
-    if (d < 0.001) return { x: 0, y: 0 };
-    return { x: v.x / d, y: v.y / d };
 }
 
 function dist(a, b) {
@@ -38,24 +42,22 @@ function dist(a, b) {
     return Math.sqrt(dx * dx + dy * dy);
 }
 
-//-----------------------------------------------------------
-// CONSTANTS — MUST MATCH CODEA
-//-----------------------------------------------------------
-
-const WORLD_SIZE = 5200;
-const TICK_RATE = 30;
-const PLAYER_START_MASS = 40;
-const VIRUS_COUNT = 28;
-const VIRUS_R = 36;
+function normalize(v) {
+    const d = Math.sqrt(v.x * v.x + v.y * v.y);
+    if (d < 0.001) return { x: 0, y: 0 };
+    return { x: v.x / d, y: v.y / d };
+}
 
 //-----------------------------------------------------------
-// Rooms
+// ROOMS
 //-----------------------------------------------------------
 
-let rooms = {}; // roomCode => { players, bots, pellets, viruses }
+let rooms = {};  
+// structure:
+// rooms[code] = { players: {}, bots: {}, pellets, viruses, lastActive }
 
 //-----------------------------------------------------------
-// Create a new room
+// Create a New Room
 //-----------------------------------------------------------
 
 function createRoom() {
@@ -66,12 +68,13 @@ function createRoom() {
         bots: {},
         pellets: [],
         viruses: [],
-        created: Date.now(),
         lastActive: Date.now()
     };
 
-    // Generate pellets
-    for (let i = 0; i < 500; i++) {
+    //----------------------------------------
+    // Spawn pellets
+    //----------------------------------------
+    for (let i = 0; i < PELLET_RESPAWN; i++) {
         rooms[code].pellets.push({
             id: uuid(),
             x: rand(-WORLD_SIZE, WORLD_SIZE),
@@ -81,29 +84,52 @@ function createRoom() {
         });
     }
 
-    // Generate viruses
+    //----------------------------------------
+    // Spawn viruses
+    //----------------------------------------
     for (let i = 0; i < VIRUS_COUNT; i++) {
         rooms[code].viruses.push({
             id: uuid(),
             x: rand(-WORLD_SIZE, WORLD_SIZE),
             y: rand(-WORLD_SIZE, WORLD_SIZE),
-            r: VIRUS_R
+            r: 36
         });
+    }
+
+    //----------------------------------------
+    // Spawn bots
+    //----------------------------------------
+    for (let i = 0; i < BOT_COUNT; i++) {
+        rooms[code].bots[uuid()] = {
+            id: uuid(),
+            name: "Bot" + Math.floor(Math.random()*999),
+            x: rand(-WORLD_SIZE, WORLD_SIZE),
+            y: rand(-WORLD_SIZE, WORLD_SIZE),
+            mass: PLAYER_START_MASS,
+            vx: 0, vy: 0
+        };
     }
 
     return code;
 }
 
 //-----------------------------------------------------------
-// Join room
+// API — Create Room
+//-----------------------------------------------------------
+
+app.post("/create", (req, res) => {
+    const code = createRoom();
+    res.json({ ok: true, code });
+});
+
+//-----------------------------------------------------------
+// API — Join Room
 //-----------------------------------------------------------
 
 app.post("/join", (req, res) => {
     const { code, name, color, pattern } = req.body;
 
-    if (!rooms[code]) {
-        return res.json({ ok: false, error: "Room not found" });
-    }
+    if (!rooms[code]) return res.json({ ok: false, error: "Room not found" });
 
     const id = uuid();
 
@@ -114,9 +140,8 @@ app.post("/join", (req, res) => {
         pattern,
         x: rand(-500, 500),
         y: rand(-500, 500),
-        vx: 0,
-        vy: 0,
         mass: PLAYER_START_MASS,
+        vx: 0, vy: 0,
         alive: true,
         input: { x: 0, y: 0 }
     };
@@ -127,16 +152,7 @@ app.post("/join", (req, res) => {
 });
 
 //-----------------------------------------------------------
-// Create room
-//-----------------------------------------------------------
-
-app.post("/create", (req, res) => {
-    const code = createRoom();
-    res.json({ ok: true, code });
-});
-
-//-----------------------------------------------------------
-// Input updates from clients
+// API — Player input
 //-----------------------------------------------------------
 
 app.post("/input", (req, res) => {
@@ -153,7 +169,7 @@ app.post("/input", (req, res) => {
 });
 
 //-----------------------------------------------------------
-// World state
+// API — World State (sent to Codea)
 //-----------------------------------------------------------
 
 app.get("/state", (req, res) => {
@@ -164,63 +180,91 @@ app.get("/state", (req, res) => {
     }
 
     rooms[code].lastActive = Date.now();
+
     res.json({
         ok: true,
         players: rooms[code].players,
+        bots: rooms[code].bots,
         pellets: rooms[code].pellets,
         viruses: rooms[code].viruses
     });
 });
 
 //-----------------------------------------------------------
-// Ping
+// API — Ping
 //-----------------------------------------------------------
 
-app.get("/ping", (req, res) => {
-    res.json({ ok: true, msg: "pong" });
-});
+app.get("/ping", (req, res) => res.json({ ok: true, msg: "pong" }));
 
 //-----------------------------------------------------------
-// Tick simulation
+// GAME LOOP — TICK SIMULATION
 //-----------------------------------------------------------
 
 setInterval(() => {
 
     for (const code in rooms) {
-        const room = rooms[code];
+        const R = rooms[code];
 
-        // Cleanup unused rooms
-        if (Date.now() - room.lastActive > 1000 * 60 * 25) {
+        //----------------------------------------
+        // Remove inactive rooms (20 min)
+        //----------------------------------------
+        if (Date.now() - R.lastActive > 20 * 60 * 1000) {
             delete rooms[code];
             continue;
         }
 
-        // Update players
-        Object.values(room.players).forEach(p => {
-            if (!p.alive) return;
+        //----------------------------------------
+        // Update bots
+        //----------------------------------------
+        for (const bid in R.bots) {
+            const b = R.bots[bid];
 
-            const dir = normalize(p.input);
+            // Random movement
+            b.vx += rand(-0.5, 0.5);
+            b.vy += rand(-0.5, 0.5);
+
+            const n = normalize({ x: b.vx, y: b.vy });
+            const speed = Math.max(1.2, 7.5 - b.mass * 0.003);
+
+            b.x += n.x * speed;
+            b.y += n.y * speed;
+        }
+
+        //----------------------------------------
+        // Update players
+        //----------------------------------------
+        for (const pid in R.players) {
+            const p = R.players[pid];
+            if (!p.alive) continue;
+
+            const d = normalize(p.input);
             const speed = Math.max(1.2, 7.5 - p.mass * 0.003);
 
-            p.x += dir.x * speed;
-            p.y += dir.y * speed;
-        });
+            p.x += d.x * speed;
+            p.y += d.y * speed;
+        }
 
-        // Player–Pellet eating
-        for (const pid in room.players) {
-            const p = room.players[pid];
-            for (let i = room.pellets.length - 1; i >= 0; i--) {
-                const pel = room.pellets[i];
-                if (dist(p, pel) < p.mass * 0.25) {
-                    p.mass += pel.value;
-                    room.pellets.splice(i, 1);
+        //----------------------------------------
+        // Player eats pellets
+        //----------------------------------------
+        for (const pid in R.players) {
+            const P = R.players[pid];
+            if (!P.alive) continue;
+
+            for (let i = R.pellets.length - 1; i >= 0; i--) {
+                const pel = R.pellets[i];
+                if (dist(P, pel) < P.mass * 0.25) {
+                    P.mass += pel.value;
+                    R.pellets.splice(i, 1);
                 }
             }
         }
 
+        //----------------------------------------
         // Respawn pellets
-        while (room.pellets.length < 500) {
-            room.pellets.push({
+        //----------------------------------------
+        while (R.pellets.length < PELLET_MIN) {
+            R.pellets.push({
                 id: uuid(),
                 x: rand(-WORLD_SIZE, WORLD_SIZE),
                 y: rand(-WORLD_SIZE, WORLD_SIZE),
@@ -229,19 +273,21 @@ setInterval(() => {
             });
         }
 
-        // Player–Player eating
-        const players = Object.values(room.players);
-        for (let i = 0; i < players.length; i++) {
-            for (let j = 0; j < players.length; j++) {
+        //----------------------------------------
+        // Player-vs-player eating
+        //----------------------------------------
+        const allP = Object.values(R.players);
+        for (let i = 0; i < allP.length; i++) {
+            for (let j = 0; j < allP.length; j++) {
                 if (i === j) continue;
 
-                const A = players[i];
-                const B = players[j];
+                const A = allP[i];
+                const B = allP[j];
 
                 if (!A.alive || !B.alive) continue;
 
-                if (A.mass > B.mass * 1.22 && dist(A, B) < A.mass * 0.22) {
-                    A.mass += B.mass * 0.9;
+                if (A.mass > B.mass * 1.25 && dist(A, B) < A.mass * 0.20) {
+                    A.mass += B.mass * 0.85;
                     B.alive = false;
                 }
             }
@@ -251,9 +297,9 @@ setInterval(() => {
 }, 1000 / TICK_RATE);
 
 //-----------------------------------------------------------
-// Start server
+// START SERVER
 //-----------------------------------------------------------
 
 app.listen(PORT, () => {
-    console.log("CellClash server running on port", PORT);
+    console.log("CellClash PRO server running on port", PORT);
 });
